@@ -1,0 +1,37 @@
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index c02eb36154..de0710b5ca 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -4772,8 +4772,13 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+         }
+         return total;
+     };
+-    // One output buffer for every batch, sized for the first (the largest).
+-    const auto output = staging_buffer_pool.Request(make_copies(0, batch), MemoryUsage::DeviceLocal);
++    // One output buffer for every batch, sized for the first (the largest). The pool holds it until
++    // the last batch's copy is recorded (FreeDeferred below). Given the tick it was taken in, the
++    // pool counted it free once that tick was done, while later batches still wrote and copied it:
++    // 01.219.026 crashed so in Ocarina of Time, in vkCmdCopyBufferToImage with the buffer deleted.
++    // Only the last batch's decode submits (`wait`): `map`, the caller's, is held for the tick it was
++    // taken in, so every batch reads it before that submit.
++    auto output = staging_buffer_pool.Request(make_copies(0, batch), MemoryUsage::DeviceLocal, true);
+     std::vector<u32> batch_layers(batch);
+     for (u32 first = 0; first < layers; first += batch) {
+         const u32 count = (std::min)(batch, layers - first);
+@@ -4804,7 +4809,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+                     .aspect_mask = VK_IMAGE_ASPECT_COLOR_BIT,
+                     .initialized = first != 0,
+                     .level_view = [&pending](s32 level) { return *pending.views[level]; },
+-                    .wait = true,
++                    .wait = first + count >= layers,
+                     .layers = std::span<const u32>(batch_layers.data(), count),
+                     .layer_view = [&pending, first, batch](s32 level, u32 layer) {
+                         return *pending.layer_views[static_cast<size_t>(level) * batch +
+@@ -4843,6 +4848,7 @@ void TextureCacheRuntime::TranscodeAstcToBcn(
+             });
+         }
+     }
++    staging_buffer_pool.FreeDeferred(output);
+     pending.tick = scheduler.CurrentTick();
+     pending_transcodes.push_back(std::move(pending));
+ }

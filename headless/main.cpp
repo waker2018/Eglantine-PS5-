@@ -696,9 +696,21 @@ int main(int argc, char** argv) {
 #else
         // Library > Game settings take precedence over Settings > Video.
         const auto game_video = Eden::LoadGameSettings(eden_game_title_id(selected_game.c_str()));
-        const auto backend = game_video.renderer >= 0 ?
+        const auto chosen_backend = game_video.renderer >= 0 ?
             (game_video.renderer == 0 ? Eden::GraphicsBackend::OpenGL : Eden::GraphicsBackend::Vulkan) :
             Eden::LoadPreferences().backend;
+#ifdef EDEN_PS5_VULKAN
+        // The Legend of Zelda: Ocarina of Time on OpenGL filled the app's 6 GiB heap: in game the
+        // first time, then reading its OpenGL shader cache at every later start (a null write at
+        // eboot+0xb54321 each time). On Vulkan it plays, so it always starts there.
+        const bool vulkan_only_title =
+            eden_game_title_id(selected_game.c_str()) == 0x0400486024DEC000ULL;
+        const auto backend = vulkan_only_title ? Eden::GraphicsBackend::Vulkan : chosen_backend;
+        if (backend != chosen_backend)
+            Eden::Report("launch", "OpenGL is not used for this game: Vulkan instead");
+#else
+        const auto backend = chosen_backend;
+#endif
 #ifdef EDEN_PS5_VULKAN
         // The user-facing diagnostics option controls Eden logs, not synchronous
         // driver traces for every draw. Keep those in explicit development probes.

@@ -55,6 +55,15 @@ Current core pin: **Eglantine `0ca2032`** (`nx2`, `build-219` + 35 commits, 2026
 
 On the console, the Vulkan driver hung a Switch 2 game when it started from the pipeline cache saved by an earlier run. This build neither loads nor saves that global cache (`tools/eglantine-patches/0010-…`); per-game caches still work. If you ever see a hang at 98%, delete `/data/eglantineps5/user/cache/shader/` and tell us (attach `eden_log.txt`).
 
+## Local changes on top of v1.219.029 (not released)
+
+From one console's logs of Ocarina of Time on v1.219.029:
+
+- **Always on Vulkan** (`headless/main.cpp`): on OpenGL the game filled the app's 6 GiB heap. The first run ran out in game (`std::bad_alloc`); every later run ran out while reading the game's OpenGL shader cache and crashed at the same address. A game setting of OpenGL is now overridden for this title, and the launch log says `OpenGL is not used for this game: Vulkan instead`.
+- **No task and mesh draws** (`tools/eglantine-patches/0083-…`): with them, every Vulkan run froze about 4 s after the intro movie, with the GPU's back thread inside one command (the same 5838 words left each time). With the testing switch "Task and mesh draws: Off", two runs played on into Kokiri Forest at 16-27 fps. "Task and mesh draws: On" draws them again.
+- **ASTC arrays re-compressed in batches** (`0084`, `0085`, from branch `experiment/memoria-cpu`): both of those runs then ended with `VK_ERROR_OUT_OF_DEVICE_MEMORY` at the game's 1365x1365, 90-layer texture array. In the experimental builds the game still ran out of memory later (at 584 s on 01.219.027), so this moves the end, it does not remove it.
+- Not tested on a console yet.
+
 ## Changes in v1.219.029
 
 - **Ocarina of Time closing as Kokiri Forest loads** (`tools/eglantine-patches/0082-…`): the log of issue #21 shows the session ending with `VK_ERROR_OUT_OF_DEVICE_MEMORY` while the pool still had a 322 MiB free block. The request that failed was a single buffer of 1,065,418,752 bytes, made while binding the storage buffers of one of the game's compute programs. The word after a storage buffer's pointer was taken as the buffer's size whenever it fitted inside the mapping; there it is most likely the float `1.0` (`0x3F800000`), not a size. A word above 256 MiB is now treated as not being a size, and the buffer is bound like a bare pointer (up to 8 MiB). When that happens the log says `Storage buffer size word … is not a size: bound as a bare pointer`.
@@ -166,6 +175,9 @@ All changes to the emulator core are plain patches in [`tools/eglantine-patches/
 | 0079 | Draws recorded after a graphics pipeline that failed to build are dropped instead of reaching the driver (Felipe Lima, Lichii #142) |
 | 0080 | Dirty memory gatherers are serialized: video decoding also gathers off the GPU thread (Paulo Tumabing, core part of Lichii #138; a VP9 movie crash) |
 | 0081 | No lost wake when worker tasks are cancelled (Zortos, core part of Lichii #290) |
+| 0083 | Ocarina of Time runs without task and mesh draws, like Mario Kart World (0046): with them, every run stopped right after its intro movie |
+| 0084 | ASTC arrays are re-compressed to BC1/BC3 at most 64 MiB of layers at a time (`EDEN_NX2_TRANSCODE_BATCH_MIB`): Ocarina of Time's 1365x1365, 90-layer array needed 894 MB plus 224 MB at once (core patch 0089 of branch `experiment/memoria-cpu`) |
+| 0085 | That re-compression keeps its output buffer until its last batch (core patch 0090 of the same branch: build 01.219.026 crashed in `vkCmdCopyBufferToImage` without it) |
 
 0074-0081 come from [zortos293/Lichii](https://github.com/zortos293/Lichii) (`nx2`), an Eglantine-based emulator. 0055-0069 and 0071 come from Eglantine's branch `oot-optimization-fixes` (Djihads80/Eglantine), not yet in `nx2`; its idle spin commit `8dc1e6e9c4` is left out, because the PS5 frontend already spins about 100 µs before a guest core sleeps, and its front flush commit `727a9a4eb4` is 0050. Number 0006 is intentionally missing: 32 storage buffers per stage is now in the core itself. Frontend changes (NUP in the library, "pack to NUP", `.gitmodules` pointing at Djihads80's core, Vulkan-port anchors for the newest core, per-line log flushing) are ordinary commits on top of the upstream frontend.
 

@@ -1,0 +1,29 @@
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index cb7606308..4eaa2fc44 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -388,14 +388,22 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+     // Mario Kart World: these draws hang the PS5's GPU a few seconds into its map screen, and a run
+     // without them reached the menu with nothing visibly missing. EDEN_NX2_MKW_MESH=1 draws them
+     // (Settings > Diagnostics > Testing switches).
++    // The Legend of Zelda: Ocarina of Time: with them, every run stopped right after its intro
++    // movie, the GPU's back thread inside one command for good (the same 5838 words unread each
++    // time); with EDEN_NX2_NO_MESH=1, two runs played on into Kokiri Forest. The same switch
++    // draws them there.
+     static const bool mkw_mesh = [] {
+         const char* value = std::getenv("EDEN_NX2_MKW_MESH");
+         return value != nullptr && value[0] != '0';
+     }();
+-    const bool no_mesh_title{!mkw_mesh && Settings::GetCurrentProgramID() == 0x0400C3F00006E000ULL};
++    const u64 program_id = Settings::GetCurrentProgramID();
++    const bool mkw_title{program_id == 0x0400C3F00006E000ULL};
++    const bool oot_title{program_id == 0x0400486024DEC000ULL};
++    const bool no_mesh_title{!mkw_mesh && (mkw_title || oot_title)};
+     if (mesh_draw && (no_mesh || no_mesh_title || !device.IsExtMeshShaderSupported())) {
+         report_failure(no_mesh         ? "EDEN_NX2_NO_MESH"
+-                       : no_mesh_title ? "off for Mario Kart World"
++                       : no_mesh_title ? (mkw_title ? "off for Mario Kart World"
++                                                    : "off for Ocarina of Time")
+                                        : "no VK_EXT_mesh_shader");
+         return;
+     }

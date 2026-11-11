@@ -26,6 +26,9 @@ jobs:
         run: |
           set -euo pipefail
           clang-18 --version | head -1
+          # The console build has LZ4 (the guest swap's packing, EDEN_SWAP_LZ4): without it some of
+          # guest_memory_service.inc is left out where the rest still names it.
+          sudo apt-get install -y --no-install-recommends liblz4-dev >/dev/null
           clang-18 -std=gnu17 -Wall -Wextra -Wno-unused-parameter -fsyntax-only src/direct_memory.c
           clang++-18 -std=c++20 -Wall -fsyntax-only -Iheadless src/memory_pages.cpp
           clang++-18 -std=c++20 -Wall -fsyntax-only -Iheadless -DPS5_NATIVE=1 -DEDEN_JIT_ALIAS_NATIVE=1 src/memory_pages.cpp

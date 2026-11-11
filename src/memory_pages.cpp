@@ -883,8 +883,6 @@ void CommitSparsePage(std::uintptr_t page) noexcept {
     // the caches evict, in rounds of 250 ms with no lock of ours held.
 #ifdef PS5_NATIVE
     const unsigned wait_ms = eden_governor_wait_ms ? eden_governor_wait_ms("EDEN_GOV_COMMIT_WAIT_MS", 8000) : 0;
-#else
-    const unsigned wait_ms = 0;
 #endif
     const auto wait_for_memory = [&](unsigned& waited) {
 #ifdef PS5_NATIVE

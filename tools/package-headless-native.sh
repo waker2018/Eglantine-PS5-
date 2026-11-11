@@ -60,6 +60,11 @@ cp "$root/build/self-update/self-updater.elf" "$app/self-updater.elf"
 cp "$root/sce_sys/"{param.json,icon0.png,pic0.dds,pic1.dds,snd0.at9} "$app/sce_sys/"
 rm -rf "$app/ui"
 cp -a "$root/headless/eglantineps5/ui" "$app/ui"
+# The governor build's env files (env.txt is what the app reads; the others are copied over it to
+# compare): next to eboot.bin, as the dev builds of issue 21 ship theirs.
+for preset in "$root"/presets/env*.txt; do
+    if [[ -f "$preset" ]]; then cp "$preset" "$app/"; fi
+done
 # The switches the runner reads from the app folder (headless/main.cpp). Only a development
 # package gets them: the profile title otherwise takes its timed input replay instead of the
 # controller, and a release build never parses the file.

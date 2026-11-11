@@ -521,6 +521,21 @@ ALLOCATOR_REFUSED = """    VkResult created = CALL;
                 created = AGAIN;
                 std::fprintf(stderr, "EDEN_GRAPHICS_MEMORY asked once more: result %d, DETAIL\\n", int(created), VALUES);
             }
+            // The pool governor (src/direct_memory.c): a buffer has no fallback, so rather than end the
+            // session it waits for memory while the reclaimers give back and the caches evict, up to
+            // EDEN_GOV_BUFFER_WAIT_MS (default 3000; 0: end as before), and is asked for again each time
+            // the pool has room for it.
+            if (created != VK_SUCCESS && eden_governor_wait && eden_governor_wait_ms) {
+                const unsigned wait_ms = eden_governor_wait_ms("EDEN_GOV_BUFFER_WAIT_MS", 3000);
+                unsigned waited = 0;
+                for (; created != VK_SUCCESS && waited < wait_ms; waited += 250) {
+                    if (!eden_governor_wait(static_cast<std::size_t>(ci.size), 250, 3)) continue;
+                    created = AGAIN;
+                }
+                std::fprintf(stderr, "EDEN_GOV buffer of %llu KiB %s after waiting %u ms\\n",
+                             static_cast<unsigned long long>(ci.size >> 10),
+                             created == VK_SUCCESS ? "placed" : "still refused", waited);
+            }
             if (created != VK_SUCCESS) {
                 ReportRefused();
             }
@@ -692,7 +707,7 @@ bool MemoryAllocator::NoFallbackLeft(const VkImageCreateInfo& ci) const {
     return ends;
 }'''),
     ('#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n',
-     '#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n#include <atomic>\n#include <cstddef>\n#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n#include "performance.h"\nnamespace Common { void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept; }\nextern "C" std::size_t eden_heap_committed(void);\nextern "C" std::size_t eden_guest_reserve_lend(std::size_t) __attribute__((weak));\nextern "C" std::size_t eden_guest_memory_reclaim(std::size_t) __attribute__((weak));\n'),
+     '#include "video_core/vulkan_common/vulkan_memory_allocator.h"\n#include <atomic>\n#include <cstddef>\n#include <cstdio>\n#include <cstring>\n#include <cstdlib>\n#include "performance.h"\nnamespace Common { void GuestMemoryUsage(std::size_t* span, std::size_t* held) noexcept; }\nextern "C" std::size_t eden_heap_committed(void);\nextern "C" std::size_t eden_guest_reserve_lend(std::size_t) __attribute__((weak));\nextern "C" std::size_t eden_guest_memory_reclaim(std::size_t) __attribute__((weak));\nextern "C" int eden_governor_wait(std::size_t, unsigned, int) __attribute__((weak));\nextern "C" unsigned eden_governor_wait_ms(const char*, unsigned) __attribute__((weak));\n'),
     # An image the pool could not hold would be made with nothing bound: reads give zero, writes are
     # lost, and Eden's comment above says AMD's drivers do not survive sampling one. So it gets what a
     # buffer gets, and only then the fallback. The fallback stays: now and then an image too big for

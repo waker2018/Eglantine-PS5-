@@ -1,0 +1,93 @@
+diff --git a/src/video_core/renderer_vulkan/vk_texture_cache.cpp b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+index 9306a386a..881e5e169 100644
+--- a/src/video_core/renderer_vulkan/vk_texture_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_texture_cache.cpp
+@@ -602,6 +602,39 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+     }();
+     return layers;
+ }
++// EDEN_GOV_TEX_TRIM_MIB=<MiB> (off unless set; OOT-PS5 memory design, phase 1): the same trim, made
++// only while the pool governor (src/direct_memory.c) is at yellow or worse (the pool's largest free
++// block under EDEN_GOV_YELLOW_MIB), and for single textures too (EDEN_GOV_TEX_TRIM_LAYERS, default
++// 1): degrade a new large texture by one level instead of failing it, while memory is short. Images
++// made while the pool has room keep every level. It is decided once for each image: TrimmedHostInfo
++// is asked several times while one image is made (its allocation, a backing after an unbacked one,
++// its sparse layers), and the answers must agree. The first question on a thread takes the latch,
++// and Image::Image lets it go when that image is made.
++extern "C" int eden_governor_level(void) __attribute__((weak));
++thread_local int governor_trim_latch = -1;
++[[nodiscard]] u64 GovernorTrimLimit() {
++    static const u64 limit = [] {
++        const char* value = std::getenv("EDEN_GOV_TEX_TRIM_MIB");
++        return value != nullptr ? std::strtoull(value, nullptr, 10) << 20 : 0ULL;
++    }();
++    return limit;
++}
++[[nodiscard]] u32 GovernorTrimLayers() {
++    static const u32 layers = [] {
++        const char* value = std::getenv("EDEN_GOV_TEX_TRIM_LAYERS");
++        return value != nullptr ? (std::max)(static_cast<u32>(std::strtoul(value, nullptr, 10)), 1U) : 1U;
++    }();
++    return layers;
++}
++[[nodiscard]] bool GovernorTrimNow() {
++    if (GovernorTrimLimit() == 0 || eden_governor_level == nullptr) {
++        return false;
++    }
++    if (governor_trim_latch < 0) {
++        governor_trim_latch = eden_governor_level() >= 1 ? 1 : 0;
++    }
++    return governor_trim_latch == 1;
++}
+ // The host bytes of `info`'s levels from `skip` on, as the host keeps them: ASTC as BC1 or BC3
+ // (RGBA8 when not re-compressed), another format at its own size.
+ [[nodiscard]] u64 HostBytesFromLevel(const ImageInfo& info, u32 skip) {
+@@ -650,10 +683,17 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+         }
+     }
+     // The opt-in trim: on top of the GPU-decode one, or for an array the CPU converts or uploads as
+-    // it is (the GPU BCn transcode's uploads are not adapted to a trim).
+-    const u64 trim = TextureTrimLimit();
++    // it is (the GPU BCn transcode's uploads are not adapted to a trim). While the pool governor says
++    // memory is short (EDEN_GOV_TEX_TRIM_MIB), its own limit and layer count apply where they trim more.
++    const bool governor_trim = GovernorTrimNow();
++    const u64 static_trim = TextureTrimLimit();
++    const u64 trim = !governor_trim ? static_trim
++                     : static_trim == 0 ? GovernorTrimLimit()
++                                        : (std::min)(static_trim, GovernorTrimLimit());
++    const u32 trim_layers =
++        governor_trim ? (std::min)(TextureTrimLayers(), GovernorTrimLayers()) : TextureTrimLayers();
+     if (trim != 0 && info.type == ImageType::e2D && info.num_samples == 1 &&
+-        info.resources.layers >= static_cast<s32>(TextureTrimLayers()) &&
++        info.resources.layers >= static_cast<s32>(trim_layers) &&
+         (IsPixelFormatASTC(info.format) || IsPixelFormatBCn(info.format)) &&
+         (level_offset != 0 || (!decoded_on_gpu && !WillUseGpuBcnTranscode(device, info)))) {
+         const u32 before = level_offset;
+@@ -663,9 +703,15 @@ constexpr std::array<VkFormat, 2> OpaqueAstcViewFormats{VK_FORMAT_BC1_RGBA_UNORM
+             ++level_offset;
+         }
+         if (level_offset != before) {
+-            LOG_WARNING(Render_Vulkan, "{}x{}x{} array of {} MiB on the host over EDEN_NX2_TEX_TRIM_MIB: keeping mip levels {}+ ({} MiB)",
+-                        info.size.width, info.size.height, info.resources.layers, HostBytesFromLevel(info, before) >> 20,
+-                        level_offset, HostBytesFromLevel(info, level_offset) >> 20);
++            static std::atomic<u32> governor_trims{0};
++            const u32 count = governor_trim ? ++governor_trims : 0;
++            if (!governor_trim || count <= 16 || (count & (count - 1)) == 0) {
++                LOG_WARNING(Render_Vulkan, "{}x{}x{} array of {} MiB on the host over {}: keeping mip levels {}+ ({} MiB){}",
++                            info.size.width, info.size.height, info.resources.layers, HostBytesFromLevel(info, before) >> 20,
++                            governor_trim ? "EDEN_GOV_TEX_TRIM_MIB (memory short)" : "EDEN_NX2_TEX_TRIM_MIB",
++                            level_offset, HostBytesFromLevel(info, level_offset) >> 20,
++                            governor_trim ? fmt::format(", {} so far", count) : std::string{});
++            }
+         }
+     }
+     if (level_offset == 0) {
+@@ -3438,6 +3484,8 @@ Image::Image(TextureCacheRuntime& runtime_, const ImageInfo& info_, GPUVAddr gpu
+                 MakeStorageView(device, level, *original_image, storage_format);
+         }
+     }
++    // EDEN_GOV_TEX_TRIM_MIB: this image is made; the next one asks the governor again.
++    governor_trim_latch = -1;
+ }
+ 
+ Image::Image(const VideoCommon::NullImageParams& params) : VideoCommon::ImageBase{params} {}

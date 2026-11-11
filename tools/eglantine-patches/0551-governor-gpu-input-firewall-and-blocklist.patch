@@ -1,0 +1,281 @@
+diff --git a/src/video_core/governor_firewall.h b/src/video_core/governor_firewall.h
+new file mode 100644
+index 000000000..28b618b12
+--- /dev/null
++++ b/src/video_core/governor_firewall.h
+@@ -0,0 +1,190 @@
++// SPDX-FileCopyrightText: 2026 EglantinePS5 contributors
++// SPDX-License-Identifier: GPL-3.0-or-later
++
++// The GPU input firewall and its self-healing block list (OOT-PS5 memory design, phase 3).
++//
++// A hang on the PS5's GPU or in the GPU thread costs a forced power-off and a new jailbreak, so a
++// draw that cannot be right is better dropped than sent. Two parts, both off unless asked for:
++//
++// EDEN_GOV_FIREWALL=1: before a direct draw reaches the driver, its index range is checked against
++// the index buffer the game bound (when the game set a limit at all: Mario Kart World leaves it at 0),
++// and its instance count against a ceiling. The vertex and index counts already have one
++// (RasterizerVulkan::Draw, 16M). Dropped draws are counted in the log.
++//
++// EDEN_GOV_BLOCKLIST=<file> (the app sets it to user/governor/<title>.txt): the draw or dispatch the
++// GPU thread is recording is noted (InFlight). When a guest thread has waited EDEN_GOV_STUCK_S
++// (default 20) for the GPU thread while one is noted, its pipeline's key goes into the file, once.
++// The game is then stuck for good, but at the next start every draw or dispatch of that pipeline is
++// skipped: the hang after Ocarina of Time's intro (the GPU's back thread inside one command, the
++// same 5838 words unread in every run) would have been passed on the second start without bisecting
++// programs by hand. Delete the file to draw them again.
++#pragma once
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <mutex>
++#include <unordered_set>
++
++#include "common/common_types.h"
++#include "common/logging.h"
++
++namespace VideoCommon::GovernorFirewall {
++
++[[nodiscard]] inline bool Enabled() {
++    static const bool enabled = [] {
++        const char* const value = std::getenv("EDEN_GOV_FIREWALL");
++        return value != nullptr && value[0] == '1';
++    }();
++    return enabled;
++}
++
++/// A pipeline's key for the block list: its programs' hashes, and whether it is a compute one.
++[[nodiscard]] inline u64 Key(const u64* hashes, size_t count, bool compute) {
++    u64 key = compute ? 0x9E3779B97F4A7C15ULL : 0xCBF29CE484222325ULL;
++    for (size_t i = 0; i < count; ++i) {
++        key = (key ^ hashes[i]) * 0x100000001B3ULL;
++        key ^= key >> 29;
++    }
++    return key != 0 ? key : 1;
++}
++
++[[nodiscard]] inline const char* BlocklistPath() {
++    static const char* const path = [] {
++        const char* const value = std::getenv("EDEN_GOV_BLOCKLIST");
++        return value != nullptr && value[0] != '\0' ? value : nullptr;
++    }();
++    return path;
++}
++
++struct Blocklist {
++    std::mutex mutex;
++    std::unordered_set<u64> keys;
++    std::atomic<size_t> size{0};
++};
++[[nodiscard]] inline Blocklist& List() {
++    static Blocklist* const list = [] {
++        auto* const loaded = new Blocklist; // outlives every static destructor
++        if (const char* const path = BlocklistPath()) {
++            if (std::FILE* const file = std::fopen(path, "r")) {
++                unsigned long long key = 0;
++                while (std::fscanf(file, "%llx", &key) == 1) {
++                    loaded->keys.insert(key);
++                }
++                std::fclose(file);
++            }
++            loaded->size.store(loaded->keys.size(), std::memory_order_relaxed);
++            if (!loaded->keys.empty()) {
++                LOG_WARNING(HW_GPU, "EDEN_GOV block list {}: {} pipelines a hang was found in are skipped",
++                            path, loaded->keys.size());
++            }
++        }
++        return loaded;
++    }();
++    return *list;
++}
++
++/// Whether draws and dispatches of this pipeline are skipped (it was recording when the GPU thread hung).
++[[nodiscard]] inline bool Blocked(u64 key) {
++    if (BlocklistPath() == nullptr) {
++        return false;
++    }
++    Blocklist& list = List();
++    if (list.size.load(std::memory_order_relaxed) == 0) {
++        return false;
++    }
++    std::scoped_lock lock{list.mutex};
++    return list.keys.contains(key);
++}
++
++/// The pipeline whose draw or dispatch the GPU thread is in now; 0: none.
++inline std::atomic<u64> in_flight{0};
++
++struct InFlight {
++    explicit InFlight(u64 key) noexcept {
++        if (BlocklistPath() != nullptr) {
++            in_flight.store(key, std::memory_order_relaxed);
++        }
++    }
++    ~InFlight() {
++        if (BlocklistPath() != nullptr) {
++            in_flight.store(0, std::memory_order_relaxed);
++        }
++    }
++    InFlight(const InFlight&) = delete;
++    InFlight& operator=(const InFlight&) = delete;
++};
++
++/// A guest thread has waited `waited_s` seconds for the GPU thread (GPU::Impl::WaitForSyncOperation).
++inline void OnStuck(unsigned waited_s) {
++    const char* const path = BlocklistPath();
++    if (path == nullptr) {
++        return;
++    }
++    static const unsigned after = [] {
++        const char* const value = std::getenv("EDEN_GOV_STUCK_S");
++        const unsigned seconds = value != nullptr ? static_cast<unsigned>(std::strtoul(value, nullptr, 10)) : 20U;
++        return seconds != 0 ? seconds : 20U;
++    }();
++    if (waited_s < after) {
++        return;
++    }
++    const u64 key = in_flight.load(std::memory_order_relaxed);
++    static std::atomic<u64> written{0};
++    if (key == 0 || written.exchange(key, std::memory_order_relaxed) == key) {
++        return;
++    }
++    Blocklist& list = List();
++    {
++        std::scoped_lock lock{list.mutex};
++        if (!list.keys.insert(key).second) {
++            return;
++        }
++        list.size.store(list.keys.size(), std::memory_order_relaxed);
++    }
++    if (std::FILE* const file = std::fopen(path, "a")) {
++        std::fprintf(file, "%016llx\n", static_cast<unsigned long long>(key));
++        std::fclose(file);
++    }
++    LOG_CRITICAL(HW_GPU,
++                 "EDEN_GOV the GPU thread is stuck in pipeline {:016x} ({} s): it goes into {} and is skipped "
++                 "from the next start",
++                 key, waited_s, path);
++}
++
++/// EDEN_GOV_FIREWALL: why a direct draw is dropped, or nullptr. `State` is Maxwell3D::DrawManager::State.
++template <typename State>
++[[nodiscard]] const char* CheckDraw(const State& state, bool is_indexed, u32 instance_count) {
++    if (!Enabled()) {
++        return nullptr;
++    }
++    constexpr u32 MaxInstances = u32{1} << 20;
++    if (instance_count > MaxInstances) {
++        return "instance count past 1M";
++    }
++    if (is_indexed) {
++        const auto& index = state.index_buffer;
++        const u64 start = index.StartAddress();
++        const u64 limit = index.EndAddress();
++        if (limit > start) {
++            // The limit is the last byte the buffer may be read at; 1 MiB of slack for games that
++            // set it short of what their draws read.
++            const u64 bytes = (u64{index.first} + u64{index.count}) * u64{index.FormatSizeInBytes()};
++            if (bytes > limit - start + 1 + (u64{1} << 20)) {
++                return "index range past its buffer";
++            }
++        }
++    }
++    return nullptr;
++}
++
++/// A dropped draw, counted; the first 16 and then every 256th are logged.
++inline void Dropped(const char* why) {
++    static std::atomic<u32> dropped{0};
++    const u32 count = dropped.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (count <= 16 || (count & 255) == 0) {
++        LOG_WARNING(HW_GPU, "EDEN_GOV firewall dropped a draw ({}); {} so far", why, count);
++    }
++}
++
++} // namespace VideoCommon::GovernorFirewall
+diff --git a/src/video_core/gpu.cpp b/src/video_core/gpu.cpp
+index b5781fcb0..041aa57dc 100644
+--- a/src/video_core/gpu.cpp
++++ b/src/video_core/gpu.cpp
+@@ -32,6 +32,7 @@
+ #include "video_core/control/channel_state.h"
+ #include "video_core/control/scheduler.h"
+ #include "video_core/dma_pusher.h"
++#include "video_core/governor_firewall.h"
+ #include "video_core/engines/fermi_2d.h"
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/engines/kepler_memory.h"
+@@ -370,6 +371,8 @@ struct GPU::Impl {
+              }); waited += 5) {
+             LOG_WARNING(HW_GPU, "A guest thread has waited {} s for the GPU thread: operation {} of {}",
+                         waited, CurrentSyncRequestFence(), fence);
++            // EDEN_GOV_BLOCKLIST (video_core/governor_firewall.h): the pipeline it is stuck in, if any.
++            VideoCommon::GovernorFirewall::OnStuck(waited);
+         }
+     }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 056560f7a..c17fc11d0 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -44,6 +44,7 @@
+ #include "video_core/native_query_trace.h"
+ #include "video_core/readback_wait.h"
+ #include "video_core/indirect_reset.h"
++#include "video_core/governor_firewall.h"
+ #include "video_core/engines/maxwell_3d.h"
+ #include "video_core/engines/kepler_compute.h"
+ #include "video_core/engines/maxwell_3d.h"
+@@ -1073,6 +1074,18 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func) {
+         TimedAb::Get().SkipDraw(pipeline->Key().unique_hashes, maxwell3d->regs)) {
+         return;
+     }
++    // EDEN_GOV_BLOCKLIST (video_core/governor_firewall.h): a pipeline the GPU thread hung in at an
++    // earlier start is skipped; this one is noted while its draw is made, for the watchdog.
++    const u64 governor_key =
++        VideoCommon::GovernorFirewall::BlocklistPath() != nullptr
++            ? VideoCommon::GovernorFirewall::Key(pipeline->Key().unique_hashes.data(),
++                                                 pipeline->Key().unique_hashes.size(), false)
++            : 0;
++    if (governor_key != 0 && VideoCommon::GovernorFirewall::Blocked(governor_key)) {
++        report_failure("EDEN_GOV_BLOCKLIST");
++        return;
++    }
++    const VideoCommon::GovernorFirewall::InFlight governor_in_flight{governor_key};
+     std::scoped_lock lock{buffer_cache.mutex, texture_cache.mutex};
+     // update engine as channel may be different.
+     pipeline->SetEngine(maxwell3d, gpu_memory);
+@@ -1304,6 +1317,12 @@ void RasterizerVulkan::Draw(bool is_indexed, u32 instance_count) {
+             }
+             return;
+         }
++        // EDEN_GOV_FIREWALL=1 (video_core/governor_firewall.h): an index range past the buffer the
++        // game bound, or an instance count no draw uses, is dropped too.
++        if (const char* const why = VideoCommon::GovernorFirewall::CheckDraw(state, is_indexed, instance_count)) {
++            VideoCommon::GovernorFirewall::Dropped(why);
++            return;
++        }
+     }
+     TraceWindowTarget(*maxwell3d, *gpu_memory, is_indexed ? "draw-indexed" : "draw",
+                       is_indexed ? maxwell3d->draw_manager.draw_state.index_buffer.count
+@@ -1980,6 +1999,19 @@ void RasterizerVulkan::DispatchCompute() {
+     if (TimedAb::Get().Active() && TimedAb::Get().SkipDispatch(pipeline_cache.LastComputeHash())) {
+         return;
+     }
++    // EDEN_GOV_BLOCKLIST (video_core/governor_firewall.h), as for draws.
++    const u64 governor_hash = pipeline_cache.LastComputeHash();
++    const u64 governor_key = VideoCommon::GovernorFirewall::BlocklistPath() != nullptr
++                                 ? VideoCommon::GovernorFirewall::Key(&governor_hash, 1, true)
++                                 : 0;
++    if (governor_key != 0 && VideoCommon::GovernorFirewall::Blocked(governor_key)) {
++        static std::atomic<u32> blocked{0};
++        if (blocked.fetch_add(1, std::memory_order_relaxed) < 16) {
++            LOG_WARNING(HW_GPU, "Dispatch skipped (EDEN_GOV_BLOCKLIST): compute {:#x}", governor_hash);
++        }
++        return;
++    }
++    const VideoCommon::GovernorFirewall::InFlight governor_in_flight{governor_key};
+     std::scoped_lock lock{texture_cache.mutex, buffer_cache.mutex};
+     // Command list pages the dispatch writes are copied for the split's front right after it.
+     buffer_cache.Nx2CollectListCopies(true);

@@ -1,0 +1,75 @@
+name: Governor quick check
+
+# A few minutes, before the hour-long release build: the syntax of the frontend files the pool
+# governor changes, the whole core patch series on the pinned core, the Vulkan port's anchors and the
+# firewall header compiled on its own. Nothing is built or packaged.
+on:
+  push:
+    branches: ['oot-governor']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+
+      - name: Frontend files
+        run: |
+          set -euo pipefail
+          clang-18 --version | head -1
+          clang-18 -std=gnu17 -Wall -Wextra -Wno-unused-parameter -fsyntax-only src/direct_memory.c
+          clang++-18 -std=c++20 -Wall -fsyntax-only -Iheadless src/memory_pages.cpp
+          clang++-18 -std=c++20 -Wall -fsyntax-only -Iheadless -DPS5_NATIVE=1 -DEDEN_JIT_ALIAS_NATIVE=1 src/memory_pages.cpp
+          python3 -m py_compile tools/prepare-vulkan-port.py headless/check_package.py
+          bash -n tools/package-headless-native.sh
+          bash -n tools/build-package.sh
+          bash -n tools/build-headless-native.sh
+          bash -n tools/run-check.sh
+
+      - name: Core patch series on the pinned core
+        run: |
+          set -euo pipefail
+          bash tools/apply-eglantine-patches.sh | tail -5
+          git -C Eglantine status --short | wc -l
+
+      - name: Vulkan port anchors (report)
+        run: |
+          set -euo pipefail
+          python3 tools/prepare-vulkan-port.py --report Eglantine "$RUNNER_TEMP/port" | tail -20 || true
+
+      - name: Firewall header on its own
+        # The system's fmt may not be the one the core pins: a failure here is a hint, not a stop.
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends libfmt-dev >/dev/null
+          cat > "$RUNNER_TEMP/firewall.cpp" <<'CPP'
+          #include "video_core/governor_firewall.h"
+          struct Index {
+              u32 first = 0, count = 0;
+              u64 StartAddress() const { return 0x1000; }
+              u64 EndAddress() const { return 0x1fff; }
+              size_t FormatSizeInBytes() const { return 2; }
+          };
+          struct State { Index index_buffer; };
+          int main() {
+              State state;
+              state.index_buffer.count = 100;
+              const u64 hashes[2] = {1, 2};
+              (void)VideoCommon::GovernorFirewall::Key(hashes, 2, false);
+              (void)VideoCommon::GovernorFirewall::Blocked(1);
+              VideoCommon::GovernorFirewall::InFlight noted{1};
+              VideoCommon::GovernorFirewall::OnStuck(5);
+              return VideoCommon::GovernorFirewall::CheckDraw(state, true, 1) != nullptr;
+          }
+          CPP
+          clang++-18 -std=c++20 -fsyntax-only -IEglantine/src "$RUNNER_TEMP/firewall.cpp"

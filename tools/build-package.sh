@@ -9,6 +9,7 @@ set -euo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$root"
+source "$root/tools/run-check.sh"
 mode=${1:?usage: tools/build-package.sh release|dev TITLE_ID}
 scratch=$(cat .local/headless-cache)
 export PS5_PAYLOAD_SDK="$scratch/sdk"
@@ -37,17 +38,17 @@ echo "== Eden for the PS5 ($mode, $(git rev-parse --short HEAD 2>/dev/null || ec
 bash tools/check-elevation-client.sh
 python3 -B tools/build-lapy-helper.py
 bash tools/build-headless-native.sh --graphics
-python3 -B tools/check-radv-native.py
+run_check python3 -B tools/check-radv-native.py
 echo "== Package $EDEN_PACKAGE_DIR"
 rm -rf "$EDEN_PACKAGE_DIR"
 bash tools/package-headless-native.sh --integration
 if [[ $mode == release ]]; then
-    python3 -B headless/check_package.py --check
+    run_check python3 -B headless/check_package.py --check
 elif [[ -f CANDIDATE.json ]]; then
     # Development layout: the console runner verifies this receipt before every run.
     python3 -B headless/check_package.py --freeze
     python3 -B headless/check_package.py --verify
 else
-    python3 -B headless/check_package.py --check
+    run_check python3 -B headless/check_package.py --check
 fi
 echo "== Built $EDEN_PACKAGE_DIR"

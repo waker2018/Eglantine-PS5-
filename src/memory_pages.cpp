@@ -474,7 +474,25 @@ extern "C" int eden_direct_high(std::size_t size, std::size_t alignment, int typ
 // Where the system puts it: a 2 MiB block of this file's, which a session gives back.
 extern "C" int eden_direct_low(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
 extern "C" int eden_direct_guest(std::size_t size, std::size_t alignment, int type, std::int64_t* start);
+// The pool governor (src/direct_memory.c): the same with the owner named for its ledger, and the wait
+// for memory a request the pool refused may take instead of ending the session. Weak: the host check
+// of this file (tools/check-jit-allocator.py) links without them.
+extern "C" int eden_direct_owned(int owner, int high, std::size_t size, std::size_t alignment, int type,
+                                 std::int64_t* start) __attribute__((weak));
+extern "C" int eden_governor_wait(std::size_t bytes, unsigned max_ms, int owner) __attribute__((weak));
+extern "C" unsigned eden_governor_wait_ms(const char* name, unsigned fallback) __attribute__((weak));
 #endif
+
+namespace {
+// The governor's owners (src/direct_memory.c, EDEN_OWNER_*).
+enum : int { GovernorJit = 4, GovernorTables = 5, GovernorHeap = 2 };
+#ifdef PS5_NATIVE
+int DirectOwned(int owner, bool high, std::size_t size, std::size_t alignment, std::int64_t* start) {
+    if (eden_direct_owned) return eden_direct_owned(owner, high ? 1 : 0, size, alignment, 12, start);
+    return high ? eden_direct_high(size, alignment, 12, start) : eden_direct_low(size, alignment, 12, start);
+}
+#endif
+} // namespace
 
 #ifdef PS5_NATIVE
 std::int64_t zero_block = -1;
@@ -489,7 +507,8 @@ constexpr std::uintptr_t slot_view_high = 0x3800000000ull;
 
 // A 2 MiB block of direct memory, zeroed through a mapping of its own that is gone again.
 bool ZeroedBlock(std::int64_t* physical, bool guest = false) {
-    if ((guest ? eden_direct_guest : eden_direct_low)(SparseSlot, SparseSlot, 12, physical) != 0)
+    if (guest ? eden_direct_guest(SparseSlot, SparseSlot, 12, physical) != 0
+              : DirectOwned(GovernorTables, false, SparseSlot, SparseSlot, physical) != 0)
         return false;
     void* view = reinterpret_cast<void*>(slot_view_hint.load(std::memory_order_relaxed));
     if (sceKernelMapDirectMemory(&view, SparseSlot, PROT_READ | PROT_WRITE, 0, *physical, SparseSlot) != 0) {
@@ -857,18 +876,46 @@ void CommitSparsePage(std::uintptr_t page) noexcept {
     const auto begin = range->begin.load(std::memory_order_relaxed);
     const std::size_t slot = (page - begin) / SparseSlot;
     if (range->owned[slot].load(std::memory_order_acquire)) return;
+    // Out of memory here has no way on (the caller writes the slot next), and it ended Ocarina of
+    // Time on the console with a SIGABRT in MapPhysicalMemory (crash-20261110-234005). The pool
+    // governor (src/direct_memory.c) lets the commit wait for memory instead: up to
+    // EDEN_GOV_COMMIT_WAIT_MS (default 8000; 0: end at once, as before), asking the reclaimers while
+    // the caches evict, in rounds of 250 ms with no lock of ours held.
+#ifdef PS5_NATIVE
+    const unsigned wait_ms = eden_governor_wait_ms ? eden_governor_wait_ms("EDEN_GOV_COMMIT_WAIT_MS", 8000) : 0;
+#else
+    const unsigned wait_ms = 0;
+#endif
+    const auto wait_for_memory = [&](unsigned& waited) {
+#ifdef PS5_NATIVE
+        if (waited >= wait_ms || !eden_governor_wait) return false;
+        const unsigned round = std::min(250U, wait_ms - waited);
+        waited += round;
+        (void)eden_governor_wait(SparseSlot, round, range->guest ? 1 : GovernorTables);
+        return true;
+#else
+        (void)waited;
+        return false;
+#endif
+    };
     if (range->state != nullptr) {
         // A range with slot states commits under the slot's lock (guest_memory_service.inc).
-        if (!ServiceCommit(*range, slot)) {
+        for (unsigned waited = 0; !ServiceCommit(*range, slot);) {
+            if (wait_for_memory(waited)) continue;
             ReportSparseCommitFailure(*range, slot);
             Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
             std::abort();
         }
         return;
     }
-    const std::lock_guard lock{sparse_mutex};
+    std::unique_lock lock{sparse_mutex};
     if (range->owned[slot].load(std::memory_order_relaxed)) return;
-    if (!OwnSlot(begin + slot * SparseSlot, &range->physical[slot], range->guest)) {
+    for (unsigned waited = 0; !OwnSlot(begin + slot * SparseSlot, &range->physical[slot], range->guest);) {
+        lock.unlock();
+        const bool again = wait_for_memory(waited);
+        lock.lock();
+        if (range->owned[slot].load(std::memory_order_relaxed)) return; // another thread did it meanwhile
+        if (again) continue;
         // Out of memory in the middle of a guest mapping: there is no table to continue with.
         ReportSparseCommitFailure(*range, slot);
         Report("EDEN_SPARSE_TABLES commit failed: out of memory\n");
@@ -995,8 +1042,7 @@ bool CommitMemoryRangeFrom(void* address, std::size_t size, bool high) noexcept 
     while (done < size) {
         block = std::min(block, size - done);
         std::int64_t physical = -1;
-        const int taken = high ? eden_direct_high(block, LargePage, 12, &physical)
-                               : eden_direct_low(block, LargePage, 12, &physical);
+        const int taken = DirectOwned(GovernorHeap, high, block, LargePage, &physical);
         if (taken != 0) {
             if (block != LargePage) {
                 block = std::max(LargePage, block / 2 / LargePage * LargePage);
@@ -1146,7 +1192,7 @@ bool CommitCodeStep(CodeRange& range, std::size_t offset) {
     // A step that stopped half way goes on from the blocks it has (the JIT asks again).
     for (std::size_t piece = range.pieces - offset / LargePage; piece < CodePieces; ++piece) {
         std::int64_t physical = -1;
-        if (eden_direct_low(LargePage, LargePage, 12, &physical) != 0 && !TakeHostReserveBlock(&physical)) {
+        if (DirectOwned(GovernorJit, false, LargePage, LargePage, &physical) != 0 && !TakeHostReserveBlock(&physical)) {
             // EDEN_JIT_RESERVE_LEND=1 (off unless asked for): a piece the pool refuses ends the
             // session ("the console has no memory for its next part": run 161, 20 MiB left while
             // the guest's reserve held 256 MiB at its floor; TakeHostReserveBlock lends only above
@@ -1155,7 +1201,8 @@ bool CommitCodeStep(CodeRange& range, std::size_t offset) {
             // more: a piece is one 2 MiB block, so any lent block serves. EDEN_GUEST_RESERVE_FLOOR
             // sets what may go.
             static const bool lend = std::getenv("EDEN_JIT_RESERVE_LEND") != nullptr && std::getenv("EDEN_JIT_RESERVE_LEND")[0] == '1';
-            if (!lend || eden_guest_reserve_lend(LargePage) == 0 || eden_direct_low(LargePage, LargePage, 12, &physical) != 0)
+            if (!lend || eden_guest_reserve_lend(LargePage) == 0 ||
+                DirectOwned(GovernorJit, false, LargePage, LargePage, &physical) != 0)
                 return false;
             std::fputs("EDEN_JIT_MEMORY a piece the pool refused came from the guest's reserve\n", stderr);
         }

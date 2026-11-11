@@ -313,6 +313,29 @@ bool swap_all_pools = false;
 std::size_t swap_ahead_bytes = 0;                // EDEN_GUEST_SWAP_AHEAD_MIB, 0 = only while short
 std::atomic<std::size_t> swap_pool_largest{0};   // the pool's largest free block at the last tick
 std::atomic<std::uint64_t> swap_pool_first{0}, swap_pool_end{0}; // the slots of the game's pool
+// EDEN_GOV_SWAP_CPU_ONLY=1 (OOT-PS5 memory design, phase 4): slots the GPU's page table maps
+// (core memory_manager.cpp tells eden_guest_gpu_map at each map and unmap) are neither armed nor sent
+// out. Packing with every slot (heydemoura's EDEN_CRAM_PACK) was followed by garbage draws and GPU
+// hangs: some path reads game memory without the fault that brings a slot back, and the GPU side is
+// where such paths are (mapped buffers, DMA reads, command lists). The CPU's private memory still
+// goes. A count per 2 MiB slot, saturating; a map whose unmap is missed keeps its slots here (the safe
+// way). 8192 slots cover the guest's 16 GiB range.
+constexpr std::size_t GpuMapSlots = 8192;
+std::atomic<std::uint16_t> gpu_map_count[GpuMapSlots]{};
+std::atomic<std::uint64_t> gpu_map_skipped{0};
+bool SwapCpuOnly() noexcept {
+    static const bool on = [] {
+        const char* const value = std::getenv("EDEN_GOV_SWAP_CPU_ONLY");
+        return value != nullptr && value[0] == '1';
+    }();
+    return on;
+}
+// Whether the swap leaves this slot alone (EDEN_GOV_SWAP_CPU_ONLY): the GPU maps it.
+bool SwapSkipsGpuSlot(std::size_t slot) noexcept {
+    if (!SwapCpuOnly() || slot >= GpuMapSlots || gpu_map_count[slot].load(std::memory_order_relaxed) == 0) return false;
+    gpu_map_skipped.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
 std::uint32_t swap_places = 1024;                // places in the file
 const char* swap_path = "/data/eglantineps5/guest-swap.bin";
 const char* swap_refused = "";
@@ -1651,6 +1674,7 @@ void ReserveKeeper() {
 #ifdef PS5_NATIVE
 // Own -> Probe, unless it was touched a moment ago. A hot slot pays one fault every SwapRearmTicks.
 bool ArmSlot(SparseRange& range, std::size_t slot, bool at_once = false) noexcept {
+    if (SwapSkipsGpuSlot(slot)) return false;
     LockSlot(range, slot);
     const std::uint8_t state = SlotState(range, slot);
     const std::uint32_t now = swap_tick.load(std::memory_order_relaxed);
@@ -1669,6 +1693,7 @@ bool ArmSlot(SparseRange& range, std::size_t slot, bool at_once = false) noexcep
 // lock; a Probe slot that is touched meanwhile goes back to Own only once this is over. The mapping
 // goes away whole and the address space is reserved at once, as the heap gives a block back.
 bool SwapOut(SparseRange& range, std::size_t slot) noexcept {
+    if (SwapSkipsGpuSlot(slot)) return false;
 #ifdef EDEN_SWAP_LZ4
     if (swap_mode.load(std::memory_order_relaxed) == 3)
         return pack_shared.load(std::memory_order_relaxed) ? PackShared(range, slot) : PackOut(range, slot);
@@ -3166,6 +3191,28 @@ extern "C" int eden_guest_swap_address_state(const void* host, int* ever_out) no
     if (ever_out != nullptr && slot < SwapEverOutSlots)
         *ever_out = static_cast<int>((swap_ever_out[slot / 64].load(std::memory_order_relaxed) >> (slot % 64)) & 1);
     return SlotState(*range, slot);
+}
+
+// The GPU's page table maps (delta 1) or unmaps (-1) the guest memory at `host` (core
+// memory_manager.cpp, EDEN_GOV_SWAP_CPU_ONLY): the slots it covers count up or down. Addresses
+// outside the guest's range are not counted.
+extern "C" void eden_guest_gpu_map(const void* host, std::size_t bytes, int delta) noexcept {
+    if (host == nullptr || bytes == 0 || !SwapCpuOnly()) return;
+    SparseRange* const range = guest_range.load(std::memory_order_acquire);
+    if (range == nullptr) return;
+    const auto at = reinterpret_cast<std::uintptr_t>(host);
+    const std::uintptr_t begin = range->begin.load(std::memory_order_relaxed);
+    if (at < begin || at >= range->end) return;
+    const std::uintptr_t end = std::min<std::uintptr_t>(at + bytes, range->end);
+    for (std::size_t slot = (at - begin) / SparseSlot; slot <= (end - 1 - begin) / SparseSlot && slot < GpuMapSlots; ++slot) {
+        auto& count = gpu_map_count[slot];
+        std::uint16_t value = count.load(std::memory_order_relaxed);
+        if (delta > 0) {
+            while (value != 0xffff && !count.compare_exchange_weak(value, value + 1, std::memory_order_relaxed)) {}
+        } else {
+            while (value != 0 && value != 0xffff && !count.compare_exchange_weak(value, value - 1, std::memory_order_relaxed)) {}
+        }
+    }
 }
 
 // A graphics allocation found no memory (the port's MemoryAllocator::ReleaseRefused): cold slots go

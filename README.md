@@ -33,6 +33,32 @@ A PS5 homebrew build that stacks three layers, always updated in this order:
 
 Current core pin: **Eglantine `0ca2032`** (`nx2`, `build-219` + 35 commits, 2026-11-05).
 
+## Governor build (01.219.130, on Vampinity's T120; not tested on a console yet)
+
+Every Ocarina of Time crash in the logs of issue 21 and of this build's tests ended with the console's
+12 GiB pool down to a 0-4 MiB free block, each time in another owner: a guest page table's slot
+(`SIGABRT` in `CommitSparsePage`), a staging buffer (`VK_ERROR_OUT_OF_DEVICE_MEMORY`), the driver, the
+JIT. The hangs had one thing in common too: data nobody checked reached the GPU. This build adds one
+place that sees the whole pool, waits for memory where a refusal ended the session, degrades instead
+of failing, and keeps a hang from coming back. Each part is a line in `env.txt` (shipped next to
+`eboot.bin`; `env-no-governor.txt` is the same without them, to compare):
+
+| Line | What it does | Where |
+|---|---|---|
+| (always) | The pool by owner: guest, heap, driver, JIT, page tables, stacks, other; the line `EDEN_GOV` in `stderr.log` every 20 s | `src/direct_memory.c` |
+| `EDEN_GOV_CENSUS=1` | That line every 5 s | `headless/performance.cpp` |
+| `EDEN_GOV_COMMIT_WAIT_MS=8000` (default) | A guest page table slot the pool refused waits for memory instead of `abort()`: the reclaimers (heap trim, the guest's reserve above its floor, cold guest memory) are asked every 100 ms, and the caches evict at their hardest while anyone waits | `src/memory_pages.cpp` |
+| `EDEN_GOV_BUFFER_WAIT_MS=3000` (default) | The same for a Vulkan buffer after `ReleaseRefused` (a buffer has no fallback) | `tools/prepare-vulkan-port.py` |
+| `EDEN_GOV_DRIVER_WAIT_MS=1500` (default) | The same for the driver's own buffers (`eden_radv_out_of_memory`) | `headless/performance.cpp` |
+| `EDEN_GOV_TEX_TRIM_MIB=32` | While the pool's largest free block is under 1.5 GiB (`EDEN_GOV_YELLOW_MIB`), a new compressed texture over 32 MiB keeps one mip level less, single textures too; decided once per image | core `0550` |
+| `EDEN_GOV_FIREWALL=1` | Direct draws whose index range is past the index buffer the game bound, or with more than 1M instances, are dropped | core `0551` |
+| `EDEN_GOV_HEAL=1` | The pipeline the GPU thread is in when a guest thread has waited 20 s for it (`EDEN_GOV_STUCK_S`) goes into `config/governor-<title id>.txt`, and is skipped from the next start | core `0551`, `headless/main.cpp` |
+| `EDEN_GOV_SWAP_CPU_ONLY=1` (off) | Guest memory the GPU's page table maps is never armed or swapped out | core `0552`, `src/guest_memory_service.inc` |
+
+The rest of `env.txt` is GrowingBlackBeans' everyday env (firmware 13.x) without one frame ahead, and
+T120's defaults. The design and its limits: the game itself writes about 5.5 GB, so this buys room and
+a softer landing, not a guarantee.
+
 ## Status (honest version)
 
 | Item | State |

@@ -813,6 +813,16 @@ int main(int argc, char** argv) {
                 std::printf("EDEN_ENV_TITLE %s\n", entry.c_str());
             }
         }
+        // EDEN_GOV_HEAL=1 (OOT-PS5 memory design, phase 3): this game's self-healing block list,
+        // config/governor-<title id>.txt (video_core/governor_firewall.h). A pipeline the GPU thread
+        // hung in goes there and is skipped from the next start; delete the file to draw it again.
+        if (game_title && Common::PeSwitch("EDEN_GOV_HEAL") && std::getenv("EDEN_GOV_BLOCKLIST") == nullptr) {
+            char blocklist[48];
+            std::snprintf(blocklist, sizeof(blocklist), "governor-%016llx.txt", static_cast<unsigned long long>(game_title));
+            const std::string path = Eden::ConfigFile(blocklist);
+            setenv("EDEN_GOV_BLOCKLIST", path.c_str(), 1);
+            std::printf("EDEN_ENV EDEN_GOV_BLOCKLIST=%s\n", path.c_str());
+        }
 #ifndef EDEN_DEV_PROFILE
         // EDEN_UP_LEAN_DEV_TIMERS=1: the six timers only a development profile build reports
         // (performance.h, DevTotals) stop reading the clock. Read here, with env.txt and this game's

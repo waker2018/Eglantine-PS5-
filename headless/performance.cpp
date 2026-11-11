@@ -659,6 +659,15 @@ extern "C" void eden_guest_memory_report(void) __attribute__((weak));
 extern "C" void eden_guest_memory_pool_short(int is_short) __attribute__((weak));
 extern "C" void eden_guest_memory_waits(unsigned long long* won, unsigned long long* lost,
                                         unsigned long long* refused) __attribute__((weak));
+// The pool governor (src/direct_memory.c; OOT-PS5 memory design): its ledger line, the requests
+// waiting for memory now, and the reclaimers its waits ask.
+extern "C" void eden_governor_report(void) __attribute__((weak));
+extern "C" unsigned eden_governor_wanted(void) __attribute__((weak));
+extern "C" void eden_governor_register(const char* name, std::size_t (*reclaimer)(std::size_t)) __attribute__((weak));
+extern "C" int eden_governor_wait(std::size_t bytes, unsigned max_ms, int owner) __attribute__((weak));
+extern "C" unsigned eden_governor_wait_ms(const char* name, unsigned fallback) __attribute__((weak));
+extern "C" std::size_t eden_guest_reserve_lend(std::size_t bytes) __attribute__((weak));
+extern "C" std::size_t eden_guest_memory_reclaim(std::size_t want) __attribute__((weak));
 #ifdef PS5_NATIVE
 extern "C" std::int64_t sceKernelGetDirectMemorySize();
 extern "C" std::int32_t sceKernelAvailableDirectMemorySize(std::int64_t, std::int64_t, std::size_t, std::int64_t*,
@@ -829,6 +838,7 @@ static void WriteMemorySummary(std::size_t largest, bool memory_short) {
         }
     }
     ReportLedger();
+    if (eden_governor_report) eden_governor_report();
     // EDEN_NX2_POOL_WALK=1 (off unless set): the pool by block size every 20 s (EDEN_REFUSED_POOL,
     // the walk a refusal makes). available_mib is the largest block, the ledger the sum: only
     // this says how much of what is free comes in 2 MiB blocks. Up to 4096 kernel calls, on the
@@ -875,6 +885,16 @@ static void RefreshFreeMemory() {
     if (eden_guest_memory_pool_short) eden_guest_memory_pool_short(pool_short.load(std::memory_order_relaxed));
     largest_free_block.store(known ? (view.free != 0 ? view.free : 1) : 0, std::memory_order_relaxed);
     graphics_memory_short.store(view.short_memory, std::memory_order_relaxed);
+    // EDEN_GOV_CENSUS=1: the governor's ledger line every 5 s (else with the summary below, every 20 s).
+    static const bool governor_census = [] {
+        const char* const value = std::getenv("EDEN_GOV_CENSUS");
+        return value != nullptr && value[0] == '1';
+    }();
+    static std::atomic<long long> governor_ns{0};
+    if (governor_census && eden_governor_report && now - governor_ns.load(std::memory_order_relaxed) >= 5'000'000'000) {
+        governor_ns.store(now, std::memory_order_relaxed);
+        eden_governor_report();
+    }
     // The pool, the guest's memory and the heap in stderr.log every 20 s, to see what holds it.
     static std::atomic<long long> summary_ns{0};
     if (now - summary_ns.load(std::memory_order_relaxed) >= 20'000'000'000) {
@@ -917,8 +937,23 @@ static void RefreshFreeMemory() {
 // The same for a pipeline builder's heap request that waits for memory (EDEN_UP_HEAP_WAIT_MS): the
 // driver's compiler cannot take a refusal, so the caches give way until it is served.
 static bool GuestMemoryWanted() {
-    return (eden_guest_memory_wanted && eden_guest_memory_wanted() != 0) || (eden_heap_wanted && eden_heap_wanted() != 0);
+    return (eden_guest_memory_wanted && eden_guest_memory_wanted() != 0) || (eden_heap_wanted && eden_heap_wanted() != 0) ||
+           (eden_governor_wanted && eden_governor_wanted() != 0);
 }
+// The governor's reclaimers, in the order a wait asks them (cheapest first): the heap's empty spaces,
+// the guest's reserve above its floor, cold guest memory (EDEN_GUEST_SWAP_RECLAIM=1 with the swap on).
+// Each is memory work only, safe on any thread that holds none of their locks.
+[[maybe_unused]] static const bool governor_reclaimers_registered = [] {
+    if (!eden_governor_register) return false;
+    eden_governor_register("heap", [](std::size_t) -> std::size_t { return TrimHeap("the governor asked for memory"); });
+    eden_governor_register("reserve", [](std::size_t want) -> std::size_t {
+        return eden_guest_reserve_lend ? eden_guest_reserve_lend(want) : 0;
+    });
+    eden_governor_register("guest-cold", [](std::size_t want) -> std::size_t {
+        return eden_guest_memory_reclaim ? eden_guest_memory_reclaim(want) : 0;
+    });
+    return true;
+}();
 static bool GraphicsMemoryShort() {
     if (GuestMemoryWanted()) return true;
     RefreshFreeMemory();
@@ -1837,6 +1872,8 @@ extern "C" void eden_jit_compile(unsigned core, unsigned long long ns) {
 // without this the session ended at vkEndCommandBuffer (Ocarina on 13.60, crash-20261108-222452).
 // Any thread, inside the driver: only memory work here, nothing that calls back into Vulkan.
 extern "C" std::size_t eden_guest_memory_reclaim(std::size_t want) __attribute__((weak));
+extern "C" int eden_governor_wait(std::size_t bytes, unsigned max_ms, int owner) __attribute__((weak));
+extern "C" unsigned eden_governor_wait_ms(const char* name, unsigned fallback) __attribute__((weak));
 extern "C" std::uint64_t eden_radv_out_of_memory(std::uint64_t bytes) {
     static std::mutex one_at_a_time;
     const std::lock_guard lock{one_at_a_time};
@@ -1845,6 +1882,13 @@ extern "C" std::uint64_t eden_radv_out_of_memory(std::uint64_t bytes) {
     std::uint64_t freed = Eden::Performance::TrimHeap("the driver found no memory");
     if (freed < bytes && eden_guest_memory_reclaim)
         freed += eden_guest_memory_reclaim(static_cast<std::size_t>(want));
+    // The pool governor (src/direct_memory.c): still short, the buffer waits for memory rather than
+    // fail inside the driver, up to EDEN_GOV_DRIVER_WAIT_MS (default 1500; 0: as before). The driver
+    // tries again only when something came back, so a wait that found room counts as given back.
+    if (freed < bytes && eden_governor_wait && eden_governor_wait_ms &&
+        eden_governor_wait(static_cast<std::size_t>(bytes), eden_governor_wait_ms("EDEN_GOV_DRIVER_WAIT_MS", 1500), 3)) {
+        freed = (std::max)(freed, bytes);
+    }
     static std::atomic<unsigned> logged{0};
     if (logged.fetch_add(1, std::memory_order_relaxed) < 64)
         std::fprintf(stderr, "EDEN_RADV_OUT_OF_MEMORY %llu KiB asked: %llu MiB given back\n",

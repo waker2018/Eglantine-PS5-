@@ -166,9 +166,17 @@ jobs:
       - name: Build and package
         id: build
         timeout-minutes: 315
+        # This fork's runs report failing source checks instead of stopping at the first
+        # (tools/run-check.sh): a clean runner can differ from a developer's checkout.
+        env:
+          EDEN_CHECKS_REPORT_ONLY: '1'
         run: |
           ccache --zero-stats
           bash tools/ci/build-release.sh
+          if [[ -f build/check-failures.txt ]]; then
+            echo "Checks that failed (report only):"
+            cat build/check-failures.txt
+          fi
 
       - name: Report disk, ccache and the linker
         if: always()

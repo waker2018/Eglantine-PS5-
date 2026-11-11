@@ -1,0 +1,60 @@
+diff --git a/src/video_core/memory_manager.cpp b/src/video_core/memory_manager.cpp
+index f53df682e..b9886053e 100644
+--- a/src/video_core/memory_manager.cpp
++++ b/src/video_core/memory_manager.cpp
+@@ -32,7 +32,26 @@
+ #include "video_core/texture_cache/util.h"
+ #include "video_core/ubo_snapshot.h"
+ 
++// EDEN_GOV_SWAP_CPU_ONLY=1 (OOT-PS5 memory design, phase 4; src/guest_memory_service.inc): the guest
++// memory the GPU's page table maps is never swapped out. Weak: absent where the frontend has no swap.
++extern "C" void eden_guest_gpu_map(const void* host, std::size_t bytes, int delta) noexcept __attribute__((weak));
++
+ namespace Tegra {
++
++namespace {
++// The host memory behind [dev_addr, dev_addr + size), 2 MiB at a time (the swap's slot), told to the
++// guest memory service as mapped (delta 1) or unmapped (-1).
++template <typename DeviceMemory>
++void TellGuestGpuMap(DeviceMemory& memory, DAddr dev_addr, std::size_t size, int delta) {
++    constexpr std::size_t Step = std::size_t{2} << 20;
++    for (std::size_t done = 0; done < size;) {
++        const DAddr at = dev_addr + done;
++        const std::size_t step = (std::min)(size - done, Step - static_cast<std::size_t>(at % Step));
++        eden_guest_gpu_map(memory.template GetPointer<u8>(at), step, delta);
++        done += step;
++    }
++}
++} // namespace
+ bool MemoryManager::IsShuttingDown() const {
+     return system.IsShuttingDown();
+ }
+@@ -241,6 +260,9 @@ void MemoryManager::BindRasterizer(VideoCore::RasterizerInterface* rasterizer_)
+ }
+ 
+ GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind, bool is_big_pages) {
++    if (eden_guest_gpu_map != nullptr && dev_addr != 0) {
++        TellGuestGpuMap(memory, dev_addr, size, 1);
++    }
+     if (is_big_pages)
+         return BigPageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
+     return PageTableOp(gpu_addr, dev_addr, size, kind, EntryType::Mapped);
+@@ -263,6 +285,18 @@ void MemoryManager::Unmap(GPUVAddr gpu_addr, std::size_t size) {
+     }
+     page_stash.clear();
+ 
++    if (eden_guest_gpu_map != nullptr) {
++        // What the range maps now, before it goes (EDEN_GOV_SWAP_CPU_ONLY).
++        constexpr std::size_t Step = std::size_t{2} << 20;
++        for (std::size_t done = 0; done < size;) {
++            const GPUVAddr at = gpu_addr + done;
++            const std::size_t step = (std::min)(size - done, Step - static_cast<std::size_t>(at % Step));
++            if (const auto dev = GpuToCpuAddress(at)) {
++                eden_guest_gpu_map(memory.GetPointer<u8>(*dev), step, -1);
++            }
++            done += step;
++        }
++    }
+     BigPageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
+     PageTableOp(gpu_addr, 0, size, PTEKind::INVALID, EntryType::Free);
+ }
